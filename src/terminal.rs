@@ -1481,6 +1481,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn test_should_use_command_extension_for_terminal_app() {
         assert!(should_use_command_extension(false, "default"));
         assert!(should_use_command_extension(false, "Terminal.app"));
