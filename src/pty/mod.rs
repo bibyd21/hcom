@@ -1024,6 +1024,11 @@ impl Proxy {
             }
         }
 
+        // PTY exited before delivery started — finalize placeholder as launch_failed.
+        if !delivery_started && !EXIT_WAS_KILLED.load(Ordering::Acquire) {
+            self.finalize_early_launch_failure();
+        }
+
         // Stop delivery thread
         self.running.store(false, Ordering::Release);
 
@@ -1033,6 +1038,53 @@ impl Proxy {
         let _ = kill(pgid, Signal::SIGTERM);
 
         self.drain_and_wait_child()
+    }
+
+    fn finalize_early_launch_failure(&mut self) {
+        let Some(instance_name) = self.config.instance_name.as_deref() else {
+            return;
+        };
+
+        let exit_status = match self.child.try_wait() {
+            Ok(Some(status)) => status,
+            _ => return,
+        };
+
+        let Ok(db) = HcomDb::open() else {
+            return;
+        };
+        let Ok(Some(instance)) = db.get_instance_full(instance_name) else {
+            return;
+        };
+
+        if instance.session_id.is_some()
+            || instance.status_context != "new"
+            || (instance.status != crate::shared::ST_INACTIVE && instance.status != "pending")
+        {
+            return;
+        }
+
+        let exit_code = exit_code_from_status(exit_status);
+        let fallback = format!("process exited before startup completed (exit code {exit_code})");
+        let Some(detail) =
+            crate::instances::finalize_launch_failure_detail(&db, &instance, Some(&fallback))
+        else {
+            return;
+        };
+
+        let launcher = std::env::var("HCOM_LAUNCHED_BY").ok();
+        let batch_id = std::env::var("HCOM_LAUNCH_BATCH_ID").ok();
+        if let (Some(launcher), Some(batch_id)) = (launcher, batch_id) {
+            if !launcher.is_empty() && launcher != "unknown" && !batch_id.is_empty() {
+                let _ = db.notify_batch_failure(&launcher, &batch_id, instance_name, &detail);
+            }
+        }
+
+        if let Ok(process_id) = std::env::var("HCOM_PROCESS_ID") {
+            if !process_id.is_empty() {
+                let _ = db.delete_process_binding(&process_id);
+            }
+        }
     }
 
     fn forward_winsize(&mut self) -> Result<()> {

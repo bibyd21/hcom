@@ -770,9 +770,12 @@ fn maybe_append_ai_tool_launch_hint(
         return message;
     }
 
-    format!(
-        "{message}\nHint: This launch was attempted from inside a managed AI tool session, where terminal or session creation may be restricted. Rerun it with approval/escalation."
-    )
+    let hint = if argv.first().map(|s| s.as_str()) == Some("tmux") {
+        "Hint: Fully reset tmux first (`tmux kill-server`), then start a fresh tmux server with approval/escalation (for example: `tmux new-session -d -s hcom-external`), then retry."
+    } else {
+        "Hint: This launch was attempted from inside a managed AI tool session, where terminal or session creation may be restricted. Rerun it with approval/escalation."
+    };
+    format!("{message}\n{hint}")
 }
 
 fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool, String)> {
@@ -1496,8 +1499,8 @@ mod tests {
             &["tmux".to_string(), "new-session".to_string()],
             true,
         );
-        assert!(message.contains("managed AI tool session"));
-        assert!(message.contains("Rerun it with approval/escalation."));
+        assert!(message.contains("tmux kill-server"));
+        assert!(message.contains("tmux new-session -d -s hcom-external"));
     }
 
     #[test]

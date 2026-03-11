@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::collections::HashSet;
+use std::process::Command;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -199,10 +200,13 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
                 context: "new".to_string(),
             };
         } else {
+            let detail = get_or_finalize_launch_failure_detail(db, data)
+                .or_else(|| extract_launch_failure_detail(data))
+                .unwrap_or_else(|| "launch probably failed - check logs or hcom list -v".to_string());
             return ComputedStatus {
                 status: ST_INACTIVE.to_string(),
                 age_string: format_age(age),
-                description: "launch probably failed — check logs or hcom list -v".to_string(),
+                description: detail,
                 age_seconds: age,
                 context: "launch_failed".to_string(),
             };
@@ -324,6 +328,113 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
         age_seconds: age,
         context: simple_context,
     }
+}
+
+pub(crate) fn get_or_finalize_launch_failure_detail(
+    db: &HcomDb,
+    data: &InstanceRow,
+) -> Option<String> {
+    finalize_launch_failure_detail(db, data, None)
+}
+
+pub(crate) fn finalize_launch_failure_detail(
+    db: &HcomDb,
+    data: &InstanceRow,
+    fallback_detail: Option<&str>,
+) -> Option<String> {
+    if data.status_context == "launch_failed" && !data.status_detail.is_empty() {
+        return Some(data.status_detail.clone());
+    }
+
+    if data.status_context != "new" || (data.status != ST_INACTIVE && data.status != "pending") {
+        return if data.status_context == "launch_failed" {
+            extract_launch_failure_detail(data)
+                .or_else(|| fallback_detail.map(ToString::to_string))
+                .or_else(|| (!data.status_detail.is_empty()).then(|| data.status_detail.clone()))
+        } else {
+            None
+        };
+    }
+
+    let detail = extract_launch_failure_detail(data)
+        .or_else(|| fallback_detail.map(ToString::to_string))
+        .unwrap_or_else(|| "launch probably failed - check logs or hcom list -v".to_string());
+
+    let mut updates = serde_json::Map::new();
+    updates.insert("status".into(), serde_json::json!(ST_INACTIVE));
+    updates.insert("status_time".into(), serde_json::json!(now_epoch_i64()));
+    updates.insert("status_context".into(), serde_json::json!("launch_failed"));
+    updates.insert("status_detail".into(), serde_json::json!(detail.clone()));
+    update_instance_position(db, &data.name, &updates);
+
+    let mut event_data = serde_json::json!({
+        "status": ST_INACTIVE,
+        "context": "launch_failed",
+        "position": data.last_event_id,
+        "detail": detail.clone(),
+    });
+    if detail.is_empty() {
+        event_data
+            .as_object_mut()
+            .map(|obj| obj.remove("detail"));
+    }
+    let _ = db.log_event("status", &data.name, &event_data);
+
+    Some(detail)
+}
+
+fn extract_launch_failure_detail(data: &InstanceRow) -> Option<String> {
+    let launch_context = data.launch_context.as_deref()?;
+    let info = crate::terminal::resolve_terminal_info_from_launch_context(launch_context);
+
+    match info.preset_name.as_str() {
+        "tmux" | "tmux-split" => capture_tmux_launch_failure(&info.pane_id, &data.tool),
+        _ => None,
+    }
+}
+
+fn capture_tmux_launch_failure(pane_id: &str, tool: &str) -> Option<String> {
+    if pane_id.is_empty() {
+        return None;
+    }
+
+    let output = Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", pane_id])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_tmux_launch_failure_output(&String::from_utf8_lossy(&output.stdout), tool)
+}
+
+fn add_tmux_server_remediation(detail: &str) -> String {
+    if !detail.contains("Operation not permitted") {
+        return detail.to_string();
+    }
+    format!(
+        "{detail} Fully reset tmux first (`tmux kill-server`), then start a fresh tmux server with approval/escalation (for example: `tmux new-session -d -s hcom-external`), then retry."
+    )
+}
+
+fn parse_tmux_launch_failure_output(captured: &str, _tool: &str) -> Option<String> {
+    let mut warning: Option<String> = None;
+
+    for line in captured.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("Error:") {
+            return Some(add_tmux_server_remediation(trimmed));
+        }
+        if warning.is_none() && trimmed.starts_with("WARNING:") {
+            warning = Some(add_tmux_server_remediation(trimmed));
+        }
+    }
+
+    warning
 }
 
 /// Build human-readable status description from status + context tokens.
@@ -2066,6 +2177,76 @@ mod tests {
         assert_eq!(result.status, ST_INACTIVE);
         assert_eq!(result.context, "launch_failed");
         cleanup(path);
+    }
+
+    #[test]
+    fn test_finalize_launch_failure_detail_uses_fallback() {
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut row = serde_json::Map::new();
+        row.insert("name".into(), serde_json::json!("test"));
+        row.insert("status".into(), serde_json::json!(ST_INACTIVE));
+        row.insert("status_context".into(), serde_json::json!("new"));
+        row.insert("created_at".into(), serde_json::json!((now - LAUNCH_PLACEHOLDER_TIMEOUT - 1) as f64));
+        row.insert("status_time".into(), serde_json::json!(0));
+        row.insert("tool".into(), serde_json::json!("codex"));
+        db.save_instance_named("test", &row).unwrap();
+
+        let data = InstanceRow {
+            name: "test".into(),
+            status: ST_INACTIVE.into(),
+            status_context: "new".into(),
+            created_at: (now - LAUNCH_PLACEHOLDER_TIMEOUT - 1) as f64,
+            ..default_instance()
+        };
+
+        let detail = finalize_launch_failure_detail(
+            &db,
+            &data,
+            Some("process exited before startup completed (exit code 1)"),
+        );
+        assert_eq!(
+            detail.as_deref(),
+            Some("process exited before startup completed (exit code 1)")
+        );
+
+        let stored = db.get_instance_full("test").unwrap().unwrap();
+        assert_eq!(stored.status_context, "launch_failed");
+        assert_eq!(
+            stored.status_detail,
+            "process exited before startup completed (exit code 1)"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_parse_tmux_launch_failure_output_prefers_error() {
+        let captured = "\
+Starting Codex...
+WARNING: proceeding, even though we could not update PATH: Operation not permitted (os error 1)
+Error: Operation not permitted (os error 1)
+";
+
+        let result = parse_tmux_launch_failure_output(captured, "codex");
+        assert_eq!(
+            result.as_deref(),
+            Some("Error: Operation not permitted (os error 1) Fully reset tmux first (`tmux kill-server`), then start a fresh tmux server with approval/escalation (for example: `tmux new-session -d -s hcom-external`), then retry.")
+        );
+    }
+
+    #[test]
+    fn test_parse_tmux_launch_failure_output_falls_back_to_warning() {
+        let captured = "\
+Starting Codex...
+WARNING: proceeding, even though we could not update PATH: Operation not permitted (os error 1)
+";
+
+        let result = parse_tmux_launch_failure_output(captured, "codex");
+        assert_eq!(
+            result.as_deref(),
+            Some("WARNING: proceeding, even though we could not update PATH: Operation not permitted (os error 1) Fully reset tmux first (`tmux kill-server`), then start a fresh tmux server with approval/escalation (for example: `tmux new-session -d -s hcom-external`), then retry.")
+        );
     }
 
     #[test]

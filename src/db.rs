@@ -1098,6 +1098,48 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Send a launcher-targeted notification for a failed launch instance.
+    ///
+    /// Used for early PTY startup failures so the launcher gets an active signal
+    /// instead of having to poll `events launch`.
+    pub fn notify_batch_failure(
+        &self,
+        launcher: &str,
+        batch_id: &str,
+        instance_name: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let text = format!(
+            "@{} Launch failed: {}: {} (batch: {})",
+            launcher, instance_name, detail, batch_id
+        );
+
+        let already_sent: bool = self.conn.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE type = 'message'
+               AND instance = 'sys_[hcom-launcher]'
+               AND json_extract(data, '$.text') = ?
+             LIMIT 1",
+            params![text],
+            |row| Ok(row.get::<_, i64>(0)? > 0),
+        )?;
+
+        if already_sent {
+            return Ok(());
+        }
+
+        let msg_data = serde_json::json!({
+            "from": "[hcom-launcher]",
+            "text": text,
+            "scope": "mentions",
+            "mentions": [launcher],
+            "sender_kind": "system",
+        });
+        self.log_event_with_ts("message", "sys_[hcom-launcher]", &msg_data, None)?;
+
+        Ok(())
+    }
+
     /// Update gate blocking status WITHOUT logging a status event.
     ///
     /// Used for transient PTY gate states (tui:*) that shouldn't pollute the events table.
@@ -4029,6 +4071,38 @@ mod tests {
             .unwrap();
         assert_eq!(delivered.len(), 1);
         assert!(delivered.contains(&"luna".to_string()));
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_notify_batch_failure_is_targeted_and_deduplicated() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('leku', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        db.notify_batch_failure("leku", "batch-1", "para", "boom")
+            .unwrap();
+        db.notify_batch_failure("leku", "batch-1", "para", "boom")
+            .unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'message'
+                   AND instance = 'sys_[hcom-launcher]'
+                   AND json_extract(data, '$.text') = '@leku Launch failed: para: boom (batch: batch-1)'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
 
         cleanup_test_db(db_path);
     }

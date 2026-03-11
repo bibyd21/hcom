@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::db::HcomDb;
+use rusqlite::params;
 
 /// Result of a launch wait operation.
 #[derive(Debug, Clone)]
@@ -72,6 +73,58 @@ fn get_ready_for_batch(db: &HcomDb, batch_id: &str) -> (i64, Vec<String>) {
         };
     let count = instances.len() as i64;
     (count, instances)
+}
+
+fn get_batch_instance_names(db: &HcomDb, batch_id: &str) -> Vec<String> {
+    let conn = db.conn();
+    let data_str: String = match conn.query_row(
+        "SELECT data FROM events
+         WHERE type = 'life'
+           AND json_extract(data, '$.action') = 'batch_launched'
+           AND json_extract(data, '$.batch_id') = ?
+         ORDER BY id DESC
+         LIMIT 1",
+        params![batch_id],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let data: serde_json::Value = match serde_json::from_str(&data_str) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    data.get("instances")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn get_batch_failure_details_for_ids(db: &HcomDb, batch_ids: &[String]) -> Vec<String> {
+    let mut details = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for batch_id in batch_ids {
+        for name in get_batch_instance_names(db, batch_id) {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let Ok(Some(inst)) = db.get_instance_full(&name) else {
+                continue;
+            };
+            if let Some(detail) = crate::instances::get_or_finalize_launch_failure_detail(db, &inst) {
+                details.push(format!("{}: {}", name, detail));
+            }
+        }
+    }
+
+    details
 }
 
 /// Aggregate multiple batches into a single LaunchData.
@@ -386,21 +439,25 @@ pub fn wait_for_launch(
     let is_timeout = status_data.ready < status_data.expected;
 
     let hint = if is_timeout {
-        let batch_info = status_data
-            .batch_id
-            .as_deref()
-            .or_else(|| {
-                status_data
-                    .batches
-                    .as_ref()
-                    .and_then(|b| b.first().map(|s| s.as_str()))
-            })
-            .unwrap_or("?");
-        Some(format!(
+        let batch_ids: Vec<String> = if let Some(ref batches) = status_data.batches {
+            batches.clone()
+        } else if let Some(ref batch_id) = status_data.batch_id {
+            vec![batch_id.clone()]
+        } else {
+            vec![]
+        };
+        let batch_display = batch_ids.first().map(|s| s.as_str()).unwrap_or("?");
+        let mut hint = format!(
             "Launch failed: {}/{} ready after {}s (batch: {}). \
              Check ~/.hcom/.tmp/logs/background_*.log or hcom list -v",
-            status_data.ready, status_data.expected, timeout_secs, batch_info
-        ))
+            status_data.ready, status_data.expected, timeout_secs, batch_display
+        );
+        let failures = get_batch_failure_details_for_ids(db, &batch_ids);
+        if !failures.is_empty() {
+            hint.push_str(" Failed instances: ");
+            hint.push_str(&failures.join("; "));
+        }
+        Some(hint)
     } else {
         None
     };
@@ -468,6 +525,14 @@ impl LaunchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    fn make_test_db() -> (HcomDb, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (db, dir)
+    }
 
     #[test]
     fn test_launch_status_as_str() {
@@ -535,5 +600,79 @@ mod tests {
         assert_eq!(json["status"], "timeout");
         assert_eq!(json["timed_out"], true);
         assert!(json["hint"].as_str().unwrap().contains("Launch failed"));
+    }
+
+    #[test]
+    fn test_get_batch_failure_details_uses_batch_instances_and_status_detail() {
+        let (db, _dir) = make_test_db();
+
+        let mut data = serde_json::Map::new();
+        data.insert("status".into(), serde_json::json!("inactive"));
+        data.insert("status_context".into(), serde_json::json!("launch_failed"));
+        data.insert("created_at".into(), serde_json::json!(crate::shared::time::now_epoch_i64()));
+        data.insert(
+            "status_detail".into(),
+            serde_json::json!("Error: Operation not permitted (os error 1) Fully reset tmux first (`tmux kill-server`), then start a fresh tmux server with approval/escalation (for example: `tmux new-session -d -s hcom-external`), then retry."),
+        );
+        db.save_instance_named("mari", &data).unwrap();
+
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-123",
+                "launched": 1,
+                "instances": ["mari"]
+            }),
+        )
+        .unwrap();
+
+        let details = get_batch_failure_details_for_ids(&db, &["batch-123".to_string()]);
+        assert_eq!(
+            details,
+            vec!["mari: Error: Operation not permitted (os error 1) Fully reset tmux first (`tmux kill-server`), then start a fresh tmux server with approval/escalation (for example: `tmux new-session -d -s hcom-external`), then retry.".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_get_batch_failure_details_finalizes_new_instance() {
+        let (db, _dir) = make_test_db();
+
+        let mut data = serde_json::Map::new();
+        data.insert("status".into(), serde_json::json!("inactive"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(crate::shared::time::now_epoch_i64()));
+        data.insert("tool".into(), serde_json::json!("codex"));
+        data.insert(
+            "launch_context".into(),
+            serde_json::json!(r#"{"terminal_preset":"tmux","pane_id":""}"#),
+        );
+        db.save_instance_named("mari", &data).unwrap();
+
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-456",
+                "launched": 1,
+                "instances": ["mari"]
+            }),
+        )
+        .unwrap();
+
+        let details = get_batch_failure_details_for_ids(&db, &["batch-456".to_string()]);
+        assert_eq!(
+            details,
+            vec!["mari: launch probably failed - check logs or hcom list -v".to_string()]
+        );
+
+        let stored = db.get_instance_full("mari").unwrap().unwrap();
+        assert_eq!(stored.status_context, "launch_failed");
+        assert_eq!(
+            stored.status_detail,
+            "launch probably failed - check logs or hcom list -v"
+        );
     }
 }

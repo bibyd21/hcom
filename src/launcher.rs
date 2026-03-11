@@ -1037,6 +1037,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             "failed": failed,
             "background": params.background,
             "tag": effective_tag,
+            "instances": handles
+                .iter()
+                .filter_map(|h| h.get("instance_name").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>(),
         }),
     )
     .ok();
