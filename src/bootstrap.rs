@@ -36,7 +36,7 @@ Routing rules:
 
 ## CAPABILITIES
 
-You MUST use `hcom <cmd> --name {instance_name}` for all hcom commands:
+You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 
 - Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] -- "message text"
   Or instead of --: --file <path> | --base64 <string> | pipe/heredoc
