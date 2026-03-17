@@ -256,7 +256,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
         "SELECT name, tool, status, status_context, status_detail,
                 created_at, status_time, last_stop, tcp_mode,
                 directory, tag, last_event_id, origin_device_id,
-                pid, session_id, background, launch_context
+                pid, session_id, background, terminal_preset_effective
          FROM instances ORDER BY created_at DESC",
     ) {
         Ok(s) => s,
@@ -281,7 +281,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
             row.get::<_, Option<i64>>(13)?,    // pid
             row.get::<_, Option<String>>(14)?, // session_id
             row.get::<_, Option<i64>>(15)?,    // background (headless)
-            row.get::<_, Option<String>>(16)?, // launch_context (JSON)
+            row.get::<_, Option<String>>(16)?, // terminal_preset_effective
         ))
     }) {
         Ok(r) => r,
@@ -313,7 +313,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
             pid,
             session_id,
             background,
-            launch_context,
+            terminal_preset,
         ) = row;
 
         let ctx = ctx.unwrap_or_default();
@@ -358,12 +358,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
             None
         };
 
-        // Parse terminal_preset from launch_context JSON
-        let terminal_preset = launch_context
-            .as_deref()
-            .and_then(|lc| serde_json::from_str::<serde_json::Value>(lc).ok())
-            .and_then(|v| v.get("terminal_preset")?.as_str().map(String::from))
-            .filter(|s| !s.is_empty() && s != "default");
+        let terminal_preset = terminal_preset.filter(|s| !s.is_empty() && s != "default");
 
         // Build agent with raw DB values first.
         // Unknown statuses are treated as inactive to avoid falsely showing them as live.
@@ -1551,7 +1546,7 @@ mod tests {
                 pid INTEGER,
                 session_id TEXT,
                 background INTEGER,
-                launch_context TEXT
+                terminal_preset_effective TEXT
             );
             CREATE TABLE kv (key TEXT, value TEXT);
             ",
@@ -1559,7 +1554,7 @@ mod tests {
         .unwrap();
 
         conn.execute(
-            "INSERT INTO instances (name, tool, status, status_context, status_detail, created_at, status_time, last_stop, tcp_mode, directory, tag, last_event_id, origin_device_id, pid, session_id, background, launch_context)
+            "INSERT INTO instances (name, tool, status, status_context, status_detail, created_at, status_time, last_stop, tcp_mode, directory, tag, last_event_id, origin_device_id, pid, session_id, background, terminal_preset_effective)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
                 "nazo",

@@ -136,7 +136,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
                 db,
                 &inst.name,
                 pid as u32,
-                &inst.launch_context,
+                inst,
                 is_headless,
             );
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
@@ -243,7 +243,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
                 db,
                 &inst.name,
                 pid as u32,
-                &inst.launch_context,
+                inst,
                 is_headless,
             );
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
@@ -393,8 +393,7 @@ fn kill_single(
     };
 
     let is_headless = inst.background != 0;
-    let (result, pane_closed, preset_name, pane_id) =
-        kill_instance(db, &name, pid, &inst.launch_context, is_headless);
+    let (result, pane_closed, preset_name, pane_id) = kill_instance(db, &name, pid, &inst, is_headless);
     stop_instance(db, &name, initiator, "killed");
 
     let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
@@ -431,7 +430,7 @@ fn kill_instance(
     _db: &HcomDb,
     name: &str,
     pid: u32,
-    launch_context: &Option<String>,
+    instance: &crate::db::InstanceRow,
     is_headless: bool,
 ) -> (terminal::KillResult, bool, String, String) {
     // Headless instances have no terminal pane — skip pane close
@@ -448,10 +447,10 @@ fn kill_instance(
         return (result, pane_closed, String::new(), String::new());
     }
 
-    let ti = launch_context
-        .as_deref()
-        .map(terminal::resolve_terminal_info_from_launch_context)
-        .unwrap_or_default();
+    let ti = terminal::resolve_terminal_info(
+        instance.terminal_preset_effective.as_deref(),
+        instance.launch_context.as_deref(),
+    );
 
     let (result, pane_closed) = terminal::kill_process(
         pid,

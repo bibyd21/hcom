@@ -608,8 +608,8 @@ fn launch_new_terminal() -> i32 {
         None,  // default terminal
         inside_ai,
     ) {
-        Ok(crate::terminal::LaunchResult::Success) => 0,
-        Ok(crate::terminal::LaunchResult::Failed(msg)) => {
+        Ok((crate::terminal::LaunchResult::Success, _)) => 0,
+        Ok((crate::terminal::LaunchResult::Failed(msg), _)) => {
             eprintln!("Error: {}", msg);
             1
         }

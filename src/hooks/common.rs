@@ -872,47 +872,15 @@ fn stop_instance_inner(
             if alive {
                 let hcom_dir = crate::paths::hcom_dir();
 
-                // Extract terminal info from launch_context
-                let mut terminal_preset = String::new();
-                let mut pane_id = String::new();
-                let mut proc_id = String::new();
-                let mut terminal_id = String::new();
-                let mut kitty_listen_on = String::new();
-                if let Some(ref lc_str) = instance_data.launch_context {
-                    if let Ok(lc) = serde_json::from_str::<serde_json::Value>(lc_str) {
-                        terminal_preset = lc
-                            .get("terminal_preset")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        pane_id = lc
-                            .get("pane_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        proc_id = lc
-                            .get("process_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        terminal_id = lc
-                            .get("terminal_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let lc_env = lc.get("env").and_then(|v| v.as_object());
-                        kitty_listen_on = lc
-                            .get("kitty_listen_on")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .or_else(|| {
-                                lc_env
-                                    .and_then(|e| e.get("KITTY_LISTEN_ON").and_then(|v| v.as_str()))
-                            })
-                            .unwrap_or("")
-                            .to_string();
-                    }
-                }
+                let ti = crate::terminal::resolve_terminal_info(
+                    instance_data.terminal_preset_effective.as_deref(),
+                    instance_data.launch_context.as_deref(),
+                );
+                let terminal_preset = ti.preset_name;
+                let pane_id = ti.pane_id;
+                let mut proc_id = ti.process_id;
+                let terminal_id = ti.terminal_id;
+                let kitty_listen_on = ti.kitty_listen_on;
                 // Fallback: process_bindings table
                 if proc_id.is_empty() {
                     if let Ok(mut stmt) = db

@@ -398,18 +398,13 @@ extern "C" fn handle_sighup(_: libc::c_int) {
 }
 
 /// Build minimal launch_context JSON from env vars available in the PTY process.
-/// Captures terminal_preset and process_id — the fields needed by kill to close the pane.
+/// Captures process_id and late-bound terminal metadata needed by kill.
 /// The start hook captures the full context (git_branch, tty, env snapshot) later.
 fn build_early_launch_context() -> String {
     use serde_json::{Map, Value};
 
     let mut ctx = Map::new();
 
-    if let Ok(preset) = std::env::var("HCOM_LAUNCHED_PRESET") {
-        if !preset.is_empty() {
-            ctx.insert("terminal_preset".into(), Value::String(preset));
-        }
-    }
     if let Ok(pid) = std::env::var("HCOM_PROCESS_ID") {
         if !pid.is_empty() {
             ctx.insert("process_id".into(), Value::String(pid));
@@ -423,20 +418,12 @@ fn build_early_launch_context() -> String {
         }
     }
 
-    // Capture pane_id from terminal env vars, and derive terminal_preset
-    // for same-window (run_here) launches where HCOM_LAUNCHED_PRESET isn't set.
-    let pane_id_vars: &[(&str, &str)] = &[
-        ("WEZTERM_PANE", "wezterm-split"),
-        ("TMUX_PANE", "tmux-split"),
-        ("KITTY_WINDOW_ID", "kitty-split"),
-    ];
-    for &(var, preset) in pane_id_vars {
+    // Capture pane_id from terminal env vars for same-window launches.
+    let pane_id_vars: &[&str] = &["WEZTERM_PANE", "TMUX_PANE", "KITTY_WINDOW_ID"];
+    for &var in pane_id_vars {
         if let Ok(val) = std::env::var(var) {
             if !val.is_empty() {
                 ctx.insert("pane_id".into(), Value::String(val));
-                if !ctx.contains_key("terminal_preset") {
-                    ctx.insert("terminal_preset".into(), Value::String(preset.into()));
-                }
                 break;
             }
         }

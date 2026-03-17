@@ -333,6 +333,34 @@ pub fn recover_single_orphan_to_db(
     if !orphan.directory.is_empty() {
         updates.insert("directory".into(), serde_json::json!(orphan.directory));
     }
+    if !orphan.terminal_preset.is_empty() {
+        updates.insert(
+            "terminal_preset_effective".into(),
+            serde_json::json!(orphan.terminal_preset),
+        );
+    }
+    let mut launch_context = serde_json::Map::new();
+    if !orphan.process_id.is_empty() {
+        launch_context.insert("process_id".into(), serde_json::json!(orphan.process_id));
+    }
+    if !orphan.pane_id.is_empty() {
+        launch_context.insert("pane_id".into(), serde_json::json!(orphan.pane_id));
+    }
+    if !orphan.terminal_id.is_empty() {
+        launch_context.insert("terminal_id".into(), serde_json::json!(orphan.terminal_id));
+    }
+    if !orphan.kitty_listen_on.is_empty() {
+        launch_context.insert(
+            "kitty_listen_on".into(),
+            serde_json::json!(orphan.kitty_listen_on),
+        );
+    }
+    if !launch_context.is_empty() {
+        updates.insert(
+            "launch_context".into(),
+            serde_json::json!(serde_json::to_string(&launch_context).unwrap_or_else(|_| "{}".to_string())),
+        );
+    }
     instances::update_instance_position(db, instance_name, &updates);
 
     // Create process binding

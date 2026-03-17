@@ -458,7 +458,7 @@ pub fn launch_pty(
         crate::tools::args_common::shell_quote(&script_file)
     );
 
-    match terminal::launch_terminal(
+    let (launch_result, effective_preset) = terminal::launch_terminal(
         &command,
         env,
         Some(cwd),
@@ -466,7 +466,17 @@ pub fn launch_pty(
         run_here,
         terminal,
         inside_ai_tool,
-    )? {
+    )?;
+
+    instances::persist_terminal_launch_context(
+        &crate::db::HcomDb::open()?,
+        instance_name,
+        terminal,
+        &effective_preset,
+        env.get("HCOM_PROCESS_ID").map(|s| s.as_str()),
+    );
+
+    match launch_result {
         terminal::LaunchResult::Success => Ok(true),
         terminal::LaunchResult::Background(_, _) => Ok(true),
         terminal::LaunchResult::Failed(_) => Ok(false),
@@ -745,7 +755,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         );
                         instance_env.insert("HCOM_BACKGROUND".to_string(), log_filename.clone());
 
-                        match terminal::launch_terminal(
+                        let (launch_result, effective_preset) = terminal::launch_terminal(
                             &claude_cmd,
                             &instance_env,
                             Some(working_dir),
@@ -753,7 +763,16 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             false,
                             terminal_mode,
                             inside_ai_tool,
-                        )? {
+                        )?;
+                        instances::persist_terminal_launch_context(
+                            db,
+                            &instance_name,
+                            terminal_mode,
+                            &effective_preset,
+                            Some(&process_id),
+                        );
+
+                        match launch_result {
                             terminal::LaunchResult::Background(log_file, pid) => {
                                 instances::update_instance_position(
                                     db,
@@ -763,6 +782,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                                 // Track PID for orphan detection
                                 crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
                                     process_id: &process_id,
+                                    terminal_preset: &effective_preset,
                                     tag: params.tag.as_deref().unwrap_or(""),
                                     ..crate::pidtrack::PidRecord::new(
                                         &crate::paths::hcom_dir(),
@@ -791,7 +811,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             terminal_mode,
                             inside_ai_tool,
                         );
-                        match terminal::launch_terminal(
+                        let (launch_result, effective_preset) = terminal::launch_terminal(
                             &claude_cmd,
                             &instance_env,
                             Some(working_dir),
@@ -799,7 +819,16 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             effective_run_here,
                             terminal_mode,
                             inside_ai_tool,
-                        )? {
+                        )?;
+                        instances::persist_terminal_launch_context(
+                            db,
+                            &instance_name,
+                            terminal_mode,
+                            &effective_preset,
+                            Some(&process_id),
+                        );
+
+                        match launch_result {
                             terminal::LaunchResult::Success => {
                                 handles.push(
                                     json!({"tool": "claude", "instance_name": instance_name}),

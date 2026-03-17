@@ -10,8 +10,16 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
-/// Schema version - bump on any schema change (no migrations, archive + recreate)
-const SCHEMA_VERSION: i32 = 16;
+/// Schema version - bump on any schema change.
+const SCHEMA_VERSION: i32 = 17;
+const MIGRATIONS: &[(i32, &str)] = &[(
+    17,
+    "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
+     ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
+     UPDATE instances
+     SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
+     WHERE json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
+)];
 
 use crate::shared::constants::{MENTION_PATTERN, ST_LISTENING};
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
@@ -46,7 +54,7 @@ enum SchemaCompat {
     /// Schema is compatible (or fresh DB) — proceed with init_db
     Ok,
     /// Schema is incompatible — archive, reconnect, reinit
-    NeedsArchive(String),
+    NeedsArchive(String, Option<i32>),
     /// DB is newer than code — stale process, work with existing schema
     StaleProcess,
 }
@@ -79,6 +87,8 @@ pub struct InstanceRow {
     pub origin_device_id: Option<String>,
     pub pid: Option<i64>,
     pub launch_args: Option<String>,
+    pub terminal_preset_requested: Option<String>,
+    pub terminal_preset_effective: Option<String>,
     pub launch_context: Option<String>,
     pub name_announced: i64,
     pub running_tasks: Option<String>,
@@ -142,6 +152,12 @@ impl InstanceRow {
             pid: row.get::<_, Option<i64>>("pid")?,
             launch_args: row
                 .get::<_, Option<String>>("launch_args")?
+                .filter(|s| !s.is_empty()),
+            terminal_preset_requested: row
+                .get::<_, Option<String>>("terminal_preset_requested")?
+                .filter(|s| !s.is_empty()),
+            terminal_preset_effective: row
+                .get::<_, Option<String>>("terminal_preset_effective")?
                 .filter(|s| !s.is_empty()),
             launch_context: row
                 .get::<_, Option<String>>("launch_context")?
@@ -325,6 +341,8 @@ impl HcomDb {
                 subagent_timeout INTEGER,
                 tool TEXT DEFAULT 'claude',
                 launch_args TEXT DEFAULT '',
+                terminal_preset_requested TEXT DEFAULT '',
+                terminal_preset_effective TEXT DEFAULT '',
                 idle_since TEXT DEFAULT '',
                 pid INTEGER DEFAULT NULL,
                 launch_context TEXT DEFAULT '',
@@ -419,7 +437,20 @@ impl HcomDb {
                 self.init_db()?;
                 Ok(())
             }
-            SchemaCompat::NeedsArchive(reason) => {
+            SchemaCompat::NeedsArchive(reason, old_version) => {
+                if let Some(version) = old_version {
+                    match self.try_apply_migrations(version) {
+                        Ok(true) => return Ok(()),
+                        Ok(false) => {}
+                        Err(e) => {
+                            crate::log::log_warn(
+                                "db",
+                                "schema.migration_failed",
+                                &format!("v{} -> v{} failed: {}", version, SCHEMA_VERSION, e),
+                            );
+                        }
+                    }
+                }
                 eprintln!("hcom: {}, archiving...", reason);
 
                 // Snapshot running instances to pidtrack before archive so orphan
@@ -536,6 +567,7 @@ impl HcomDb {
             if required.iter().any(|t| tables.contains(*t)) {
                 return Ok(SchemaCompat::NeedsArchive(
                     "Pre-versioned DB found".to_string(),
+                    None,
                 ));
             }
             // Has tables but not ours - fresh enough
@@ -556,20 +588,20 @@ impl HcomDb {
                 return Ok(SchemaCompat::StaleProcess);
             }
             // DB older - needs archive
-            return Ok(SchemaCompat::NeedsArchive(format!(
-                "DB version mismatch (DB v{}, code v{})",
-                version, SCHEMA_VERSION
-            )));
+            return Ok(SchemaCompat::NeedsArchive(
+                format!("DB version mismatch (DB v{}, code v{})", version, SCHEMA_VERSION),
+                Some(version),
+            ));
         }
 
         // Verify required tables exist
         let have_all = required.iter().all(|t| tables.contains(*t));
         if !have_all {
             let missing: Vec<&&str> = required.iter().filter(|t| !tables.contains(**t)).collect();
-            return Ok(SchemaCompat::NeedsArchive(format!(
-                "DB missing tables {:?}",
-                missing
-            )));
+            return Ok(SchemaCompat::NeedsArchive(
+                format!("DB missing tables {:?}", missing),
+                None,
+            ));
         }
 
         // Column guard: verify critical column exists (catches partial schema)
@@ -587,10 +619,27 @@ impl HcomDb {
         if !has_tool {
             return Ok(SchemaCompat::NeedsArchive(
                 "DB schema missing instances.tool".to_string(),
+                None,
             ));
         }
 
         Ok(SchemaCompat::Ok)
+    }
+
+    fn try_apply_migrations(&self, old_version: i32) -> Result<bool> {
+        if old_version <= 0 || old_version >= SCHEMA_VERSION {
+            return Ok(false);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for next_version in (old_version + 1)..=SCHEMA_VERSION {
+            let Some((_, sql)) = MIGRATIONS.iter().find(|(v, _)| *v == next_version) else {
+                return Ok(false);
+            };
+            tx.execute_batch(sql)?;
+            tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Archive current database at a given path.
@@ -2460,6 +2509,7 @@ impl HcomDb {
          created_at, transcript_path, tcp_mode, wait_timeout, background,
          background_log_file, name_announced, agent_id, running_tasks,
          origin_device_id, hints, subagent_timeout, tool, launch_args,
+         terminal_preset_requested, terminal_preset_effective,
          idle_since, pid, launch_context";
 
     /// Convert a row from INSTANCE_COLUMNS SELECT to JSON.
@@ -2491,9 +2541,11 @@ impl HcomDb {
             "subagent_timeout": row.get::<_, Option<i64>>(23).unwrap_or(None),
             "tool": row.get::<_, String>(24).unwrap_or_default(),
             "launch_args": row.get::<_, String>(25).unwrap_or_default(),
-            "idle_since": row.get::<_, String>(26).unwrap_or_default(),
-            "pid": row.get::<_, Option<i64>>(27).unwrap_or(None),
-            "launch_context": row.get::<_, String>(28).unwrap_or_default(),
+            "terminal_preset_requested": row.get::<_, String>(26).unwrap_or_default(),
+            "terminal_preset_effective": row.get::<_, String>(27).unwrap_or_default(),
+            "idle_since": row.get::<_, String>(28).unwrap_or_default(),
+            "pid": row.get::<_, Option<i64>>(29).unwrap_or(None),
+            "launch_context": row.get::<_, String>(30).unwrap_or_default(),
         }))
     }
 
@@ -2934,6 +2986,9 @@ mod tests {
                 background INTEGER,
                 agent_id TEXT,
                 launch_args TEXT,
+                terminal_preset_requested TEXT,
+                terminal_preset_effective TEXT,
+                launch_context TEXT,
                 origin_device_id TEXT,
                 background_log_file TEXT,
                 status_time INTEGER
@@ -3287,7 +3342,7 @@ mod tests {
             other => panic!(
                 "Expected SchemaCompat::Ok, got {:?}",
                 match other {
-                    SchemaCompat::NeedsArchive(r) => format!("NeedsArchive({})", r),
+                    SchemaCompat::NeedsArchive(r, v) => format!("NeedsArchive({}, {:?})", r, v),
                     SchemaCompat::StaleProcess => "StaleProcess".to_string(),
                     SchemaCompat::Ok => unreachable!(),
                 }
@@ -3369,6 +3424,78 @@ mod tests {
     }
 
     #[test]
+    fn test_ensure_schema_migrates_v16_to_v17_in_place() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(2500);
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = temp_dir.join(format!(
+            "test_hcom_migrate_{}_{}.db",
+            std::process::id(),
+            test_id
+        ));
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
+                 CREATE TABLE instances (
+                     name TEXT PRIMARY KEY,
+                     tool TEXT DEFAULT 'claude',
+                     created_at REAL NOT NULL,
+                     launch_context TEXT DEFAULT ''
+                 );
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 PRAGMA user_version = 16;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO instances (name, tool, created_at, launch_context) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "luna",
+                    "claude",
+                    1.0f64,
+                    r#"{"terminal_preset":"ghostty-tab"}"#
+                ],
+            )
+            .unwrap();
+        }
+
+        let mut db = HcomDb::open_at(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let preset: String = db
+            .conn
+            .query_row(
+                "SELECT terminal_preset_effective FROM instances WHERE name = ?",
+                params!["luna"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preset, "ghostty-tab");
+        let launch_context: String = db
+            .conn
+            .query_row(
+                "SELECT launch_context FROM instances WHERE name = ?",
+                params!["luna"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(launch_context, r#"{"terminal_preset":"ghostty-tab"}"#);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
     fn test_ensure_schema_column_guard() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(3000);
@@ -3400,7 +3527,7 @@ mod tests {
 
         // check_schema_compat should detect missing column
         match db.check_schema_compat().unwrap() {
-            SchemaCompat::NeedsArchive(reason) => {
+            SchemaCompat::NeedsArchive(reason, _) => {
                 assert!(reason.contains("instances.tool"), "reason: {}", reason);
             }
             _ => panic!("Expected NeedsArchive for missing tool column"),

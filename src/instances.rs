@@ -384,8 +384,10 @@ pub(crate) fn finalize_launch_failure_detail(
 }
 
 fn extract_launch_failure_detail(data: &InstanceRow) -> Option<String> {
-    let launch_context = data.launch_context.as_deref()?;
-    let info = crate::terminal::resolve_terminal_info_from_launch_context(launch_context);
+    let info = crate::terminal::resolve_terminal_info(
+        data.terminal_preset_effective.as_deref(),
+        data.launch_context.as_deref(),
+    );
 
     match info.preset_name.as_str() {
         "tmux" | "tmux-split" => capture_tmux_launch_failure(&info.pane_id, &data.tool),
@@ -992,6 +994,49 @@ pub fn update_instance_position(
     }
 }
 
+/// Persist terminal launch metadata without clobbering other launch_context fields.
+///
+/// The launcher owns the authoritative preset decision. launch_context is only
+/// for late-bound metadata such as pane_id, terminal_id, and env snapshot.
+pub fn persist_terminal_launch_context(
+    db: &HcomDb,
+    instance_name: &str,
+    requested_preset: Option<&str>,
+    effective_preset: &str,
+    process_id: Option<&str>,
+) {
+    let mut ctx = db
+        .get_instance_full(instance_name)
+        .ok()
+        .flatten()
+        .and_then(|pos| pos.launch_context)
+        .and_then(|json| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json).ok())
+        .unwrap_or_default();
+
+    if let Some(pid) = process_id.filter(|v| !v.is_empty()) {
+        ctx.insert("process_id".into(), serde_json::json!(pid));
+    }
+
+    let mut updates = serde_json::Map::new();
+    updates.insert(
+        "terminal_preset_requested".into(),
+        serde_json::json!(
+            requested_preset
+                .filter(|v| !v.is_empty() && *v != "default")
+                .unwrap_or("")
+        ),
+    );
+    updates.insert(
+        "terminal_preset_effective".into(),
+        serde_json::json!(effective_preset),
+    );
+    updates.insert(
+        "launch_context".into(),
+        serde_json::json!(serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string())),
+    );
+    update_instance_position(db, instance_name, &updates);
+}
+
 /// Capture environment context and store it for the instance.
 /// Captures git branch, terminal program, tty, and relevant env vars.
 pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
@@ -1001,8 +1046,8 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     let preserve_keys = [
         "pane_id",
         "terminal_id",
-        "terminal_preset",
         "kitty_listen_on",
+        "process_id",
     ];
     let mut ctx = new_ctx;
 
@@ -1109,16 +1154,14 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
     }
     ctx.insert("env".into(), serde_json::Value::Object(env_map));
 
-    // Terminal preset detection from env vars
-    // Rust hooks are always CLI mode, so no daemon-mode guard needed.
-    if let Some(preset_name) = crate::terminal::detect_terminal_from_env() {
-        ctx.insert("terminal_preset".into(), serde_json::json!(preset_name));
-        // Also capture pane_id from terminal-specific env var
-        // Uses merged preset lookup (TOML overrides + built-in pane_id_env)
-        if let Some(pane_id_env) = crate::config::get_merged_preset_pane_id_env(&preset_name) {
-            if let Ok(pane_id) = std::env::var(pane_id_env) {
-                if !pane_id.is_empty() {
-                    ctx.insert("pane_id".into(), serde_json::json!(pane_id));
+    // Pane IDs are late-bound. The launcher already persisted the effective preset.
+    if let Ok(preset_name) = std::env::var("HCOM_LAUNCHED_PRESET") {
+        if !preset_name.is_empty() {
+            if let Some(pane_id_env) = crate::config::get_merged_preset_pane_id_env(&preset_name) {
+                if let Ok(pane_id) = std::env::var(pane_id_env) {
+                    if !pane_id.is_empty() {
+                        ctx.insert("pane_id".into(), serde_json::json!(pane_id));
+                    }
                 }
             }
         }
@@ -2040,6 +2083,8 @@ mod tests {
                  subagent_timeout INTEGER,
                  tool TEXT DEFAULT 'claude',
                  launch_args TEXT DEFAULT '',
+                 terminal_preset_requested TEXT DEFAULT '',
+                 terminal_preset_effective TEXT DEFAULT '',
                  idle_since TEXT DEFAULT '',
                  pid INTEGER DEFAULT NULL,
                  launch_context TEXT DEFAULT '',
@@ -2618,6 +2663,8 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
             origin_device_id: None,
             pid: None,
             launch_args: None,
+            terminal_preset_requested: None,
+            terminal_preset_effective: None,
             launch_context: None,
             name_announced: 0,
             running_tasks: None,

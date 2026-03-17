@@ -920,7 +920,7 @@ pub fn launch_terminal(
     run_here: bool,
     terminal: Option<&str>,
     inside_ai_tool: bool,
-) -> Result<LaunchResult> {
+) -> Result<(LaunchResult, String)> {
     let config_and_instance_env = env.clone();
 
     // Determine terminal mode
@@ -972,12 +972,19 @@ pub fn launch_terminal(
             }
         }
 
-        if terminal_mode != "default" && terminal_mode != "print" {
-            final_env.insert("HCOM_LAUNCHED_PRESET".to_string(), terminal_mode.clone());
-        }
         if !kitty_socket.is_empty() {
             final_env.insert("KITTY_LISTEN_ON".to_string(), kitty_socket.clone());
         }
+    } else if run_here {
+        if let Some(detected) = detect_terminal_from_env() {
+            terminal_mode = detected;
+        } else if terminal_mode == "here" {
+            terminal_mode = "default".to_string();
+        }
+    }
+
+    if terminal_mode != "default" && terminal_mode != "print" {
+        final_env.insert("HCOM_LAUNCHED_PRESET".to_string(), terminal_mode.clone());
     }
 
     // Determine script extension after terminal mode resolution so explicit
@@ -1046,9 +1053,9 @@ pub fn launch_terminal(
         std::thread::sleep(std::time::Duration::from_millis(200));
         let pid = child.id();
 
-        return Ok(LaunchResult::Background(
-            log_file.to_string_lossy().to_string(),
-            pid,
+        return Ok((
+            LaunchResult::Background(log_file.to_string_lossy().to_string(), pid),
+            terminal_mode,
         ));
     }
 
@@ -1058,7 +1065,7 @@ pub fn launch_terminal(
         println!("# Script: {}", script_file.display());
         print!("{}", content);
         fs::remove_file(&script_file).ok();
-        return Ok(LaunchResult::Success);
+        return Ok((LaunchResult::Success, terminal_mode));
     }
 
     // Run in current terminal (blocking)
@@ -1145,9 +1152,12 @@ pub fn launch_terminal(
         let (success, captured_id) = spawn_terminal_process(&final_argv, inside_ai_tool)?;
         write_terminal_id(env, &captured_id);
         if success {
-            Ok(LaunchResult::Success)
+            Ok((LaunchResult::Success, terminal_mode))
         } else {
-            Ok(LaunchResult::Failed("Terminal process failed".to_string()))
+            Ok((
+                LaunchResult::Failed("Terminal process failed".to_string()),
+                terminal_mode,
+            ))
         }
     } else {
         // Platform default
@@ -1172,7 +1182,7 @@ pub fn launch_terminal(
                 .args(&am_argv[1..])
                 .status()
                 .context("Failed to launch Termux")?;
-            return Ok(LaunchResult::Success);
+            return Ok((LaunchResult::Success, terminal_mode));
         }
 
         let argv = match platform::platform_name() {
@@ -1196,9 +1206,12 @@ pub fn launch_terminal(
         let (success, captured_id) = spawn_terminal_process(&final_argv, inside_ai_tool)?;
         write_terminal_id(env, &captured_id);
         if success {
-            Ok(LaunchResult::Success)
+            Ok((LaunchResult::Success, terminal_mode))
         } else {
-            Ok(LaunchResult::Failed("Terminal process failed".to_string()))
+            Ok((
+                LaunchResult::Failed("Terminal process failed".to_string()),
+                terminal_mode,
+            ))
         }
     }
 }
@@ -1345,51 +1358,56 @@ pub fn kill_process(
     (kill_result, pane_closed)
 }
 
-/// Resolve terminal info from a JSON launch_context string.
-///
-/// Parses the launch_context JSON stored in instance position data.
-/// The caller is responsible for loading the launch_context from DB/pidtrack.
-pub fn resolve_terminal_info_from_launch_context(launch_context_json: &str) -> TerminalInfo {
-    let mut info = TerminalInfo::default();
+/// Resolve terminal info from the canonical preset fields plus launch_context metadata.
+pub fn resolve_terminal_info(
+    preset_name: Option<&str>,
+    launch_context_json: Option<&str>,
+) -> TerminalInfo {
+    let mut info = TerminalInfo {
+        preset_name: preset_name.unwrap_or("").to_string(),
+        ..TerminalInfo::default()
+    };
 
-    if let Ok(lc) = serde_json::from_str::<serde_json::Value>(launch_context_json) {
-        info.preset_name = lc
-            .get("terminal_preset")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        info.pane_id = lc
-            .get("pane_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        info.process_id = lc
-            .get("process_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        info.terminal_id = lc
-            .get("terminal_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        // Kitty socket from launch context or env snapshot
-        let lc_env = lc.get("env").and_then(|v| v.as_object());
-        info.kitty_listen_on = lc
-            .get("kitty_listen_on")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .or_else(|| lc_env.and_then(|e| e.get("KITTY_LISTEN_ON").and_then(|v| v.as_str())))
-            .unwrap_or("")
-            .to_string();
+    if let Some(launch_context_json) = launch_context_json.filter(|s| !s.is_empty()) {
+        if let Ok(lc) = serde_json::from_str::<serde_json::Value>(launch_context_json) {
+            info.pane_id = lc
+                .get("pane_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            info.process_id = lc
+                .get("process_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            info.terminal_id = lc
+                .get("terminal_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Kitty socket from launch context or env snapshot
+            let lc_env = lc.get("env").and_then(|v| v.as_object());
+            info.kitty_listen_on = lc
+                .get("kitty_listen_on")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| lc_env.and_then(|e| e.get("KITTY_LISTEN_ON").and_then(|v| v.as_str())))
+                .unwrap_or("")
+                .to_string();
+        }
     }
 
-    // Infer preset when pane_id captured but not preset
+    // Infer preset when pane_id captured but preset column isn't populated.
     if info.preset_name.is_empty() && !info.pane_id.is_empty() && !info.kitty_listen_on.is_empty() {
         info.preset_name = "kitty-split".to_string();
     }
 
     info
+}
+
+/// Parse only launch_context metadata. Prefer `resolve_terminal_info()` for runtime decisions.
+pub fn resolve_terminal_info_from_launch_context(launch_context_json: &str) -> TerminalInfo {
+    resolve_terminal_info(None, Some(launch_context_json))
 }
 
 #[cfg(test)]
@@ -1437,6 +1455,24 @@ mod tests {
     #[test]
     fn test_shell_split_unmatched_quote() {
         assert!(shell_split("foo 'bar").is_err());
+    }
+
+    #[test]
+    fn test_resolve_terminal_info_prefers_effective_preset() {
+        let info = resolve_terminal_info(Some("kitty-tab"), Some(r#"{"pane_id":"x"}"#));
+        assert_eq!(info.preset_name, "kitty-tab");
+    }
+
+    #[test]
+    fn test_resolve_terminal_info_reads_launch_context_metadata() {
+        let info = resolve_terminal_info(
+            Some("wezterm-split"),
+            Some(r#"{"pane_id":"pane-1","process_id":"proc-1","terminal_id":"term-1"}"#),
+        );
+        assert_eq!(info.preset_name, "wezterm-split");
+        assert_eq!(info.pane_id, "pane-1");
+        assert_eq!(info.process_id, "proc-1");
+        assert_eq!(info.terminal_id, "term-1");
     }
 
     #[test]
