@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(86400); // 24 hours
 
-fn flag_path() -> PathBuf {
+pub(crate) fn flag_path() -> PathBuf {
     hcom_path(&[FLAGS_DIR, "update_check"])
 }
 
@@ -61,6 +61,65 @@ fi
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+}
+
+/// Synchronously fetch the latest version from GitHub Releases API.
+/// Returns version string (without 'v' prefix) or None on failure/network error.
+fn fetch_latest_version() -> Option<String> {
+    let output = std::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "10",
+            "https://api.github.com/repos/aannoo/hcom/releases/latest",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let body = String::from_utf8_lossy(&output.stdout);
+    let tag = body
+        .lines()
+        .find(|l| l.contains("\"tag_name\""))?
+        .split('"')
+        .nth(3)?
+        .to_string();
+
+    let ver = tag.trim_start_matches('v').to_string();
+    if ver.is_empty() { None } else { Some(ver) }
+}
+
+/// Structured update information: current version, latest available, availability, and update command.
+#[derive(Clone, Debug)]
+pub struct UpdateInfo {
+    pub current: String,
+    pub latest: String,
+    pub available: bool,
+    pub cmd: &'static str,
+}
+
+/// Synchronously fetch current + latest version info from GitHub.
+/// Single source of truth for all update-related logic (fetching, parsing, command selection).
+/// Used by `hcom update` command for fresh checks.
+pub fn fetch_update_info() -> anyhow::Result<UpdateInfo> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let latest = fetch_latest_version()
+        .ok_or_else(|| anyhow::anyhow!("Could not reach GitHub API"))?;
+
+    let current_parsed = parse_version(&current);
+    let latest_parsed = parse_version(&latest);
+    let available = current_parsed < latest_parsed;
+    let cmd = get_update_cmd();
+
+    Ok(UpdateInfo {
+        current,
+        latest,
+        available,
+        cmd,
+    })
 }
 
 /// Detect install method and return appropriate update command.

@@ -552,6 +552,17 @@ const STATUS_HELP: &[HelpEntry] = &[
     ("status --json", "Machine-readable output"),
 ];
 
+const UPDATE_HELP: &[HelpEntry] = &[
+    ("update", "Check for and apply updates"),
+    ("update --check", "Only check — print status without applying"),
+    ("", ""),
+    ("", "Detects install method and runs the right update command:"),
+    ("", "  uv tool install → uv tool upgrade hcom"),
+    ("", "  pip install     → pip install -U hcom"),
+    ("", "  curl installer  → re-run install.sh"),
+    ("", "  dev build       → use ./build.sh manually"),
+];
+
 const HOOKS_HELP: &[HelpEntry] = &[
     ("hooks", "Show hook status"),
     ("hooks status", "Same as above"),
@@ -805,6 +816,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "term",
     "relay",
     "run",
+    "update",
     "claude",
     "gemini",
     "codex",
@@ -842,7 +854,8 @@ Commands:\n\
   reset        Archive and clear database\n\
   hooks        Add or remove hooks\n\
   status       Installation and diagnostics\n\
-  term         View/inject into agent PTY screens",
+  term         View/inject into agent PTY screens\n\
+  update       Check and apply updates",
         env!("CARGO_PKG_VERSION"),
     )
 }
@@ -870,6 +883,7 @@ pub fn get_command_help(name: &str) -> String {
         "archive" => Some(ARCHIVE_HELP),
         "run" => Some(RUN_HELP),
         "status" => Some(STATUS_HELP),
+        "update" => Some(UPDATE_HELP),
         "hooks" => Some(HOOKS_HELP),
         "term" => Some(TERM_HELP),
         _ => None,

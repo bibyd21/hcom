@@ -32,3 +32,4 @@ pub mod reset;
 pub(crate) mod reset_ops;
 pub(crate) mod reset_preview;
 pub mod run;
+pub mod update;

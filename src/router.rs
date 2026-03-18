@@ -77,6 +77,7 @@ const COMMANDS: &[&str] = &[
     "term",
     "relay",
     "run",
+    "update",
 ];
 
 /// Tools that support launch commands (hcom [N] <tool>)
@@ -542,6 +543,7 @@ pub fn dispatch() -> anyhow::Result<()> {
                     | "term"
                     | "relay"
                     | "run"
+                    | "update"
             ) =>
         {
             let exit_code = dispatch_native_command(cmd, args);
@@ -816,6 +818,12 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         "run" => clap_dispatch!(crate::commands::run::RunArgs, cmd, &cmd_argv, |args| {
             crate::commands::run::cmd_run(&db, &args, Some(&ctx))
         }),
+        "update" => clap_dispatch!(
+            crate::commands::update::UpdateArgs,
+            cmd,
+            &cmd_argv,
+            |args| crate::commands::update::cmd_update(&db, &args, Some(&ctx))
+        ),
         _ => {
             // Should never happen — only matched commands reach here
             eprintln!("Error: Unknown native command '{cmd}'");
